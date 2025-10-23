@@ -81,11 +81,15 @@ labelname_head = _{ 'A'..'Z' | "_" | 'a'..'z' }
 labelname_rest = _{ 'A'..'Z' | "_" | 'a'..'z' | '0'..'9' }
 
 NodeReference = @{ ("&" ~ LabelName) | ("&{" ~ NodePath ~ "}") }
+PropertyReference = @{ ("$" ~ LabelName) | ("${" ~ PropertyPath ~ "}") }
 
 // dtc will accept and normalize node paths such as "/x///y/".
 // label-relative references such as &{label/child/subnode} also work.
 NodePath = @{ nodepathchar+ }
 nodepathchar = _{ nodechar | "/" }
+
+PropertyPath = @{ propertypathchar+ }
+propertypathchar = _{ propchar | "/" }
 
 NodeBody = { OpenNode ~ NodeContents ~ CloseNode ~ EndNode }
 OpenNode = { "{" }
@@ -117,7 +121,7 @@ propchar = _{ 'A'..'Z' | 'a'..'z' | '0'..'9' | "#" | "*" | "+" | "," | "-" | "."
 PropValue = { LabeledValue ~ (Comma ~ LabeledValue)* }
 Comma = { "," }
 LabeledValue = { Label* ~ Value ~ Label* }
-Value = { Cells | QuotedString | NodeReference | ByteString | Incbin }
+Value = { Cells | QuotedString | NodeReference | PropertyReference | ByteString | Incbin }
 
 Cells = { Bits? ~ OpenCells ~ LabelOrCell* ~ CloseCells }
 Bits = { SlashBits ~ NumericLiteral }
@@ -125,7 +129,7 @@ LabelOrCell = { Label | Cell }
 OpenCells = { "<" }
 CloseCells = { ">" }
 
-Cell = { NodeReference | ParenExpr | IntLiteral }
+Cell = { NodeReference | PropertyReference | ParenExpr | IntLiteral }
 
 ParenExpr = { OpenParen ~ Expr ~ CloseParen }
 Expr = { TernaryPrec }
@@ -145,7 +149,7 @@ ComparePrec = { ShiftPrec ~ (ComparePrecOp ~ ShiftPrec)* }
 ShiftPrec = { AddPrec ~ (ShiftPrecOp ~ AddPrec)* }
 AddPrec = { MulPrec ~ (AddPrecOp ~ MulPrec)* }
 MulPrec = { UnaryPrec ~ (MulPrecOp ~ UnaryPrec)* }
-UnaryPrec = { UnaryExpr | ParenExpr | IntLiteral }
+UnaryPrec = { UnaryExpr | ParenExpr | IntLiteral | PropertyReference }
 UnaryExpr = { UnaryOp ~ UnaryPrec }
 
 EqualPrecOp = { Equal | NotEqual }

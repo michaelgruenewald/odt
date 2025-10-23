@@ -1,7 +1,7 @@
 use crate::error::SourceError;
 use crate::node::Node;
 use crate::parse::TypedRuleExt;
-use crate::parse::rules::NodeReference;
+use crate::parse::rules::{NodeReference, PropertyReference};
 use crate::path::NodePath;
 use hashlink::LinkedHashMap;
 
@@ -19,8 +19,8 @@ impl<P> LabelResolver<'_, P> {
             .ok_or_else(|| noderef.err("no such node"))
     }
 
-    fn resolve_str(&self, relative_to: &NodePath, noderef: &str) -> Option<NodePath> {
-        let path = noderef.trim_matches(['&', '{', '}']);
+    pub fn resolve_str(&self, relative_to: &NodePath, noderef: &str) -> Option<NodePath> {
+        let path = noderef.trim_matches(['&', '$', '{', '}']);
         let mut segments = path.split('/');
         let first = segments.next().unwrap();
         let segments = segments.filter(|s| !s.is_empty());
@@ -46,5 +46,34 @@ impl<P> LabelResolver<'_, P> {
             result.push(s);
         }
         Some(result)
+    }
+
+    pub(crate) fn prop_from_prop_ref(
+        &self,
+        relative_to: &NodePath,
+        propref: &PropertyReference,
+    ) -> Result<(NodePath, &P), SourceError> {
+        // root.walk() expects all segments to be Node elements, so strip off
+        // the property name after the last '/'.
+        let noderef = propref.str().rsplit_once('/').map(|(a, _)| a).unwrap_or(".");
+        let nodepath = self
+            .resolve_str(relative_to, noderef)
+            .ok_or_else(|| propref.err("no such node"))?;
+
+        // Lookup the property in the node
+        let propname = propref
+            .str()
+            .rsplit_once('/')
+            .map(|(_, b)| b)
+            .unwrap_or(propref.str())
+            .trim_matches(['$', '{', '}']);
+        let prop = self
+            .1
+            .walk(nodepath.segments())
+            .ok_or_else(|| propref.err("no such node"))?
+            .get_property(propname)
+            .ok_or_else(|| propref.err("no such property"))?;
+
+        Ok((nodepath, prop))
     }
 }

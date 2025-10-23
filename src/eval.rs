@@ -10,7 +10,9 @@ use crate::{Arena, BinaryNode, SourceNode};
 use core::str::CharIndices;
 use hashlink::{LinkedHashMap, LinkedHashSet};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::cell::RefCell;
 
 /// Assigns phandles and evaluates expressions.
 /// Call with the output of `crate::merge::merge()` or `resolve_incbin_paths()`.
@@ -220,6 +222,7 @@ fn node_phandle<P>(
         propvalue,
         |_| Err(propvalue.err("phandle expression cannot use a string node reference")),
         lookup_phandle,
+        |_| Err(propvalue.err("phandle expression cannot use property references")),
         // dtc allows this, but there's no need for it.
         |_| Err(propvalue.err("phandle expression cannot use /incbin/")),
     )?;
@@ -256,6 +259,48 @@ fn visit_node_phandles<P>(
     }
 }
 
+fn eval_property_reference(
+    loc: &NodePath,
+    labels: &LabelResolver<&Prop>,
+    phandles: &LinkedHashMap<NodePath, u32>,
+    read_file: &impl Fn(&Path) -> Result<Vec<u8>, SourceError>,
+    propref: &PropertyReference,
+    visited: &RefCell<HashSet<usize>>,
+) -> Result<Vec<u8>, SourceError> {
+    let (nodepath, prop) = labels.prop_from_prop_ref(loc, propref)?;
+
+    // Detect cycles
+    let key = &raw const *prop as usize;
+    if !visited.borrow_mut().insert(key) {
+        return Err(propref.err("property reference cycle detected"));
+    }
+
+    let Some(propvalue) = prop.prop_value else {
+        return Ok(vec![]);
+    };
+
+    // Reuse the lookup rules from `evaluate_expressions`
+    let lookup_label = |nr: &NodeReference| labels.resolve(&nodepath, nr);
+    let lookup_phandle = |nr: &NodeReference| Ok(*phandles.get(&labels.resolve(&nodepath, nr)?).unwrap());
+    let lookup_property = |pr: &PropertyReference| {
+        // Recurse to resolve nested property references
+        eval_property_reference(&nodepath, labels, phandles, read_file, pr, visited)
+    };
+
+    let result = evaluate_propvalue(
+        propvalue,
+        lookup_label,
+        lookup_phandle,
+        lookup_property,
+        |p| read_file(p),
+    );
+
+    // Remove the visited key from the set now that we're done evaluating it
+    visited.borrow_mut().remove(&key);
+
+    result
+}
+
 fn evaluate_expressions(
     root: SourceNode,
     node_labels: &LabelMap,
@@ -273,7 +318,16 @@ fn evaluate_expressions(
             let lookup_phandle = |noderef: &NodeReference| {
                 Ok(*phandles.get(&labels.resolve(loc, noderef)?).unwrap())
             };
-            match evaluate_propvalue(propvalue, lookup_label, lookup_phandle, read_file) {
+            let lookup_prop = |propref: &PropertyReference| {
+                eval_property_reference(loc, labels, phandles, &read_file, propref, &RefCell::new(HashSet::new()))
+            };
+            match evaluate_propvalue(
+                propvalue,
+                lookup_label,
+                lookup_phandle,
+                lookup_prop,
+                read_file,
+            ) {
                 Ok(v) => v,
                 Err(e) => {
                     scribe.err(e);
@@ -293,16 +347,18 @@ fn evaluate_propvalue(
     propvalue: &PropValue,
     lookup_label: impl Fn(&NodeReference) -> Result<NodePath, SourceError>,
     lookup_phandle: impl Fn(&NodeReference) -> Result<u32, SourceError>,
+    lookup_property_fn: impl Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>,
     read_file: impl Fn(&Path) -> Result<Vec<u8>, SourceError>,
 ) -> Result<Vec<u8>, SourceError> {
     let mut r = vec![];
+    let lookup_property = Some(&lookup_property_fn);
     for labeled_value in propvalue.labeled_value {
         match labeled_value.value {
             Value::Cells(cells) => {
                 let bits = match cells.bits {
                     None => 32,
                     Some(bits) => {
-                        let n = bits.numeric_literal.eval()?;
+                        let n = bits.numeric_literal.eval(lookup_property)?;
                         match n {
                             8 | 16 | 32 | 64 => n,
                             _ => return Err(bits.err("bad bit width: must be 8, 16, 32, or 64")),
@@ -321,8 +377,26 @@ fn evaluate_propvalue(
                             }
                             phandle as u64
                         }
-                        Cell::ParenExpr(expr) => expr.eval()?,
-                        Cell::IntLiteral(lit) => lit.eval()?,
+                        Cell::PropertyReference(propref) => {
+                            let bytes = lookup_property_fn(propref)?;
+                            match bytes.len() {
+                                1 if bits == 8 => bytes[0] as u64,
+                                2 if bits == 16 => {
+                                    u16::from_be_bytes(bytes.try_into().unwrap()) as u64
+                                }
+                                4 if bits == 32 => {
+                                    u32::from_be_bytes(bytes.try_into().unwrap()) as u64
+                                }
+                                8 if bits == 64 => u64::from_be_bytes(bytes.try_into().unwrap()),
+                                n => {
+                                    return Err(propref.err(format!(
+                                        "unsupported property length {n} for /bits/ == {bits}"
+                                    )));
+                                }
+                            }
+                        }
+                        Cell::ParenExpr(expr) => expr.eval(lookup_property)?,
+                        Cell::IntLiteral(lit) => lit.eval(lookup_property)?,
                     };
                     if bits < 64 {
                         // dtc warns if the lost bits are not all the same.
@@ -356,6 +430,10 @@ fn evaluate_propvalue(
                 let target = lookup_label(noderef)?;
                 r.extend(target.display().as_bytes());
                 r.push(0);
+            }
+            Value::PropertyReference(propref) => {
+                let prop = lookup_property_fn(propref)?;
+                r.extend(prop);
             }
             Value::ByteString(bytestring) => {
                 for label_or_hex_byte in bytestring.label_or_hex_byte {
@@ -476,25 +554,27 @@ impl<'a> UnescapeExt<'a> for pest::Span<'a> {
 }
 
 /// Evaluate an expression or parse a literal.
-trait EvalExt {
-    fn eval(&self) -> Result<u64, SourceError>;
+trait EvalExt<T> {
+    fn eval(&self, lookup_property: Option<&T>) -> Result<u64, SourceError>
+    where
+        T: Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>;
 }
 
-impl EvalExt for IntLiteral<'_> {
-    fn eval(&self) -> Result<u64, SourceError> {
+impl<T: Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>> EvalExt<T> for IntLiteral<'_> {
+    fn eval(&self, lookup_property: Option<&T>) -> Result<u64, SourceError> {
         match self {
             IntLiteral::CharLiteral(c) => {
                 let bytes = c.unescape()?;
                 // This is a C 'char'; it has one byte.
                 Ok(bytes[0].into())
             }
-            IntLiteral::NumericLiteral(n) => n.eval(),
+            IntLiteral::NumericLiteral(n) => n.eval(lookup_property),
         }
     }
 }
 
-impl EvalExt for NumericLiteral<'_> {
-    fn eval(&self) -> Result<u64, SourceError> {
+impl<T: Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>> EvalExt<T> for NumericLiteral<'_> {
+    fn eval(&self, _lookup_property: Option<&T>) -> Result<u64, SourceError> {
         let s = self.str().trim_end_matches(['U', 'L']); // dtc is case-sensitive here
         parse_int(s).ok_or_else(|| self.err("bad numeric literal"))
     }
@@ -514,21 +594,21 @@ fn parse_int(s: &str) -> Option<u64> {
     u64::from_str_radix(digits, radix).ok()
 }
 
-impl EvalExt for ParenExpr<'_> {
-    fn eval(&self) -> Result<u64, SourceError> {
-        self.expr.eval()
+impl<T: Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>> EvalExt<T> for ParenExpr<'_> {
+    fn eval(&self, lookup_property: Option<&T>) -> Result<u64, SourceError> {
+        self.expr.eval(lookup_property)
     }
 }
 
-impl EvalExt for Expr<'_> {
-    fn eval(&self) -> Result<u64, SourceError> {
-        self.ternary_prec.eval()
+impl<T: Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>> EvalExt<T> for Expr<'_> {
+    fn eval(&self, lookup_property: Option<&T>) -> Result<u64, SourceError> {
+        self.ternary_prec.eval(lookup_property)
     }
 }
 
-impl EvalExt for UnaryExpr<'_> {
-    fn eval(&self) -> Result<u64, SourceError> {
-        let arg = self.unary_prec.eval()?;
+impl<T: Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>> EvalExt<T> for UnaryExpr<'_> {
+    fn eval(&self, lookup_property: Option<&T>) -> Result<u64, SourceError> {
+        let arg = self.unary_prec.eval(lookup_property)?;
         match self.unary_op {
             UnaryOp::LogicalNot(_) => Ok((arg == 0).into()),
             UnaryOp::BitwiseNot(_) => Ok(!arg),
@@ -538,24 +618,24 @@ impl EvalExt for UnaryExpr<'_> {
     }
 }
 
-impl EvalExt for TernaryPrec<'_> {
-    fn eval(&self) -> Result<u64, SourceError> {
-        let left = self.logical_or_prec.eval()?;
+impl<T: Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>> EvalExt<T> for TernaryPrec<'_> {
+    fn eval(&self, lookup_property: Option<&T>) -> Result<u64, SourceError> {
+        let left = self.logical_or_prec.eval(lookup_property)?;
         let [mid, right] = self.expr else {
             return Ok(left);
         };
         // Note that subexpression evaluation is lazy, unlike dtc.
-        if left != 0 { mid.eval() } else { right.eval() }
+        if left != 0 { mid.eval(lookup_property) } else { right.eval(lookup_property) }
     }
 }
 
 macro_rules! impl_binary_eval {
     ($rule:ident, $op:ident, $arg:ident) => {
-        impl EvalExt for $rule<'_> {
-            fn eval(&self) -> Result<u64, SourceError> {
-                let mut left = self.$arg[0].eval();
+        impl<T: Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>> EvalExt<T> for $rule<'_> {
+            fn eval(&self, lookup_property: Option<&T>) -> Result<u64, SourceError> {
+                let mut left = self.$arg[0].eval(lookup_property);
                 for (op, right) in core::iter::zip(self.$op, &self.$arg[1..]) {
-                    let right = right.eval()?;
+                    let right = right.eval(lookup_property)?;
                     // It would be nice to match on the type of `op` rather than its text, but to
                     // get the compile-time safety of an exhaustive match, we'd need one match
                     // statement per precedence rule.
@@ -580,12 +660,28 @@ impl_binary_eval!(ShiftPrec, shift_prec_op, add_prec);
 impl_binary_eval!(AddPrec, add_prec_op, mul_prec);
 impl_binary_eval!(MulPrec, mul_prec_op, unary_prec);
 
-impl EvalExt for UnaryPrec<'_> {
-    fn eval(&self) -> Result<u64, SourceError> {
+impl<T: Fn(&PropertyReference) -> Result<Vec<u8>, SourceError>> EvalExt<T> for UnaryPrec<'_> {
+    fn eval(&self, lookup_property: Option<&T>) -> Result<u64, SourceError> {
         match self {
-            UnaryPrec::UnaryExpr(x) => x.eval(),
-            UnaryPrec::ParenExpr(x) => x.eval(),
-            UnaryPrec::IntLiteral(x) => x.eval(),
+            UnaryPrec::UnaryExpr(x) => x.eval(lookup_property),
+            UnaryPrec::ParenExpr(x) => x.eval(lookup_property),
+            UnaryPrec::IntLiteral(x) => x.eval(lookup_property),
+            UnaryPrec::PropertyReference(x) => {
+                let Some(lookup) = lookup_property else {
+                    return Err(x.err("property references not allowed in this evaluation context"));
+                };
+
+                let bytes = lookup(x)?;
+                match bytes.len() {
+                    1 => Ok(bytes[0] as u64),
+                    2 => Ok(u16::from_be_bytes(bytes.try_into().unwrap()) as u64),
+                    4 => Ok(u32::from_be_bytes(bytes.try_into().unwrap()) as u64),
+                    8 => Ok(u64::from_be_bytes(bytes.try_into().unwrap())),
+                    n => Err(x.err(format!(
+                        "property reference returned {n} bytes, need 4 or 8 | bytes={bytes:?}"
+                    ))),
+                }
+            },
         }
     }
 }
@@ -636,6 +732,32 @@ fn eval_binary_op(left: u64, op: &str, right: u64) -> Result<u64, &'static str> 
 }
 
 #[test]
+fn test_property_reference_cycles() {
+    const CYCLE_TEST1: &str = r#"
+/ { loop {
+    loops_back_to_b = ${loops_back_to_a};
+    loops_back_to_a = ${loops_back_to_b};
+}; }; "#;
+
+    const CYCLE_TEST2: &str = r#"
+/ { loop {
+    loops_back_to_b = ${loops_back_to_a};
+    loops_back_to_a = ${loops_back_to_b};
+}; }; "#;
+
+    for source in [CYCLE_TEST1, CYCLE_TEST2] {
+        let loader = crate::fs::DummyLoader;
+        let arena = crate::Arena::new();
+        let dts = crate::parse::parse_typed(source, &arena).unwrap();
+        let mut scribe = Scribe::new(true);
+        let (tree, node_labels, _, _) = crate::merge::merge(dts, &mut scribe);
+        _ = eval(tree, node_labels, &loader, &mut scribe);
+        let err = scribe.collect().err().unwrap();
+        assert!(err.to_string().contains("property reference cycle detected"));
+    }
+}
+
+#[test]
 fn test_eval() {
     for source in [
         include_str!("testdata/charlit.dts"),
@@ -643,6 +765,7 @@ fn test_eval() {
         include_str!("testdata/phandle.dts"),
         #[cfg(feature = "wrapping-arithmetic")]
         include_str!("testdata/random_expressions.dts"),
+        include_str!("testdata/property_references.dts"),
         include_str!("testdata/references.dts"),
     ] {
         let loader = crate::fs::DummyLoader;

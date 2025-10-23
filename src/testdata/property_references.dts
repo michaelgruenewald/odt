@@ -1,0 +1,51 @@
+/dts-v1/;
+
+/ {
+    u64_cell = /bits/ 64 <1>;
+    u32_cell = /bits/ 32 <1>;
+    u16_cell = /bits/ 16 <1>;
+    u8_cell  = /bits/  8 <1>;
+    empty_prop;
+
+    // Expressions don't depend on evaluation order
+    c = <( ${a} + ${b} )>;
+    a = <100>;
+    b = <200>;
+
+    check {
+        label_foo: foo {
+            u32_prop = <0 1>, <0 1>;
+        };
+    };
+};
+
+/ {
+    check {
+        string_prop = "value", "value";
+
+        relative_ref = ${./string_prop};
+        absolute_ref = ${/check/string_prop};
+
+        ref_to_sibling = ${string_prop};
+
+        absolute_ref_to_label  = ${/check/foo/u32_prop};
+        relative_xref_to_label = ${label_foo/u32_prop};
+        absolute_xref_to_label = ${/check/foo/u32_prop};
+
+        u64cell_test = /bits/ 64 < ${/u64_cell} 2 3 >, /bits/ 64 <1 2 3>;
+        u32cell_test = /bits/ 32 < ${/u32_cell} 2 3 >, /bits/ 32 <1 2 3>;
+        u16cell_test = /bits/ 16 < ${/u16_cell} 2 3 >, /bits/ 16 <1 2 3>;
+        u8cell_test  = /bits/  8 < ${/u8_cell} 2 3 >,  /bits/  8 <1 2 3>;
+
+        u64expr_test = /bits/ 64 <( ${/u64_cell} )>, /bits/ 64 <(1)>;
+        u32expr_test = /bits/ 32 <( ${/u32_cell} )>, /bits/ 32 <(1)>;
+        u16expr_test = /bits/ 16 <( ${/u16_cell} )>, /bits/ 16 <(1)>;
+        u8expr_test  = /bits/  8 <( ${/u8_cell} )>,  /bits/  8 <(1)>;
+
+        empty_prop_ref = ${/empty_prop};
+
+        expr_ref_test0 = <( ${/c} + ${/a} )>, <400>;
+        expr_ref_test1 = <( ${/a} * 20 )>, <2000>;
+        expr_ref_test2 = <( ${/a} - 10 + ${/c} )>, <390>;
+    };
+};
