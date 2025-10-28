@@ -115,7 +115,7 @@ fn visit_includes<'a>(
         match loader.find_utf8(dir, Path::new(pathspan.as_str())) {
             Ok(Some((ipath, src))) => match parse_typed(src, arena) {
                 Ok(dts) => visit_includes(depth + 1, loader, arena, ipath, dts, out, scribe),
-                Err(e) => scribe.err(e),
+                Err(e) => scribe.err(e.with_path(ipath)),
             },
             // TODO:  distinguish UTF-8 errors here (Err(...) vs Ok(None))
             _ => scribe.err(pathspan.err("can't find include file on search path")),
