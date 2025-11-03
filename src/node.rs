@@ -190,7 +190,11 @@ impl OptionDisplay for Vec<u8> {
                 if i > 0 {
                     _ = write!(f, ", ");
                 }
-                _ = write!(f, "\"{w}\"");
+                _ = write!(f, "\"");
+                for b in w.as_bytes() {
+                    _ = write!(f, "{}", std::ascii::escape_default(*b));
+                }
+                _ = write!(f, "\"");
             }
         } else if self.len() % 4 == 0 {
             _ = write!(f, "<");
@@ -215,11 +219,15 @@ fn guess_c_strings(s: &[u8]) -> Option<&str> {
     if s.last() != Some(&0) {
         return None;
     }
+    if s[0] == 0 && s.len() == 4 {
+        // Don't interpret a cell value such as `0x00abcd00` as two strings.
+        return None;
+    }
     let mut nuls = 0;
     for c in s {
         match c {
             0 => nuls += 1,
-            b' '..b'~' => (),
+            b' '..=b'~' => (),
             _ => return None,
         }
     }
@@ -259,4 +267,36 @@ impl Display for LabelsDisplay<'_> {
         }
         Ok(())
     }
+}
+
+#[test]
+fn test_format() {
+    let mut node = crate::BinaryNode::default();
+    // Test a couple tricky cases for `guess_c_strings()`.
+    node.set_property("azbz", 0x61006200_u32.to_be_bytes().into());
+    node.set_property("zabz", 0x00616200_u32.to_be_bytes().into());
+    assert_eq!(
+        node.get_property("azbz").unwrap().fmt_opt().unwrap(),
+        "\"a\", \"b\""
+    );
+    assert_eq!(
+        node.get_property("zabz").unwrap().fmt_opt().unwrap(),
+        "< 0x616200>"
+    );
+
+    // Verify that these round-trip through the parser and evaluator.
+    node.set_property("abc", c"abc".to_owned().into());
+    node.set_property("allbytes", (0..=255).chain(Some(0)).collect());
+    node.set_property("printable", (b' '..=b'~').chain(Some(0)).collect());
+
+    let source = format!("/ {node};");
+    let loader = crate::fs::DummyLoader;
+    let arena = crate::Arena::new();
+    let dts = crate::parse::parse_typed(&source, &arena).unwrap();
+    let mut scribe = crate::error::Scribe::new(true);
+    let (tree, node_labels, _, _) = crate::merge::merge(dts, &mut scribe);
+    let tree = crate::eval::eval(tree, node_labels, &loader, &mut scribe);
+    assert!(scribe.report(&loader, &mut std::io::stderr()));
+    assert!(tree.children.is_empty());
+    assert_eq!(tree.properties, node.properties);
 }
